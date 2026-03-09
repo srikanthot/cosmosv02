@@ -76,16 +76,25 @@ class RagContextProvider(BaseContextProvider):
 
         if TRACE_MODE:
             chunk_summary = "  |  ".join(
-                f"[{i+1}] {r['source']} p.{r.get('page', '?')} score={r['score']:.4f}"
+                "[{i}] {src} score={s:.4f}{r}".format(
+                    i=i + 1,
+                    src=r["source"],
+                    s=r["score"],
+                    r=(f" reranker={r['reranker_score']:.4f}"
+                       if r.get("reranker_score") is not None else ""),
+                )
                 for i, r in enumerate(results)
             )
             logger.info("TRACE | context_injected: %s", chunk_summary)
             # Log the full context blocks so you can see exactly what the LLM receives.
-            # Each block is already formatted with [N] header + content.
             for i, r in enumerate(results, start=1):
+                section_parts = [
+                    r.get("section1") or "", r.get("section2") or "", r.get("section3") or "",
+                ]
+                section = " > ".join(p for p in section_parts if p)
                 logger.info(
-                    "TRACE | context_block[%d] (%s p.%s):\n%s",
-                    i, r["source"], r.get("page", "?"),
+                    "TRACE | context_block[%d] (%s | %s):\n%s",
+                    i, r["source"], section or "no section",
                     r["content"][:600],
                 )
 

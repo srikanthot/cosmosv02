@@ -16,6 +16,8 @@ class Citation(BaseModel):
     """A single citation reference with structured metadata."""
 
     source: str
+    title: str = ""
+    section: str = ""
     page: str = ""
     url: str = ""
     chunk_id: str = ""

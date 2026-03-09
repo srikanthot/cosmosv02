@@ -39,7 +39,7 @@ from agent_framework import AgentSession as AFAgentSession
 from app.agent_runtime.citation_provider import build_citations
 from app.agent_runtime.session import AgentSession
 from app.api.schemas import CitationsPayload
-from app.config.settings import MIN_AVG_SCORE, MIN_RESULTS, TOP_K, TRACE_MODE
+from app.config.settings import MIN_AVG_SCORE, MIN_RERANKER_SCORE, MIN_RESULTS, TOP_K, TRACE_MODE
 from app.llm.af_agent_factory import af_agent, rag_provider
 from app.tools.retrieval_tool import retrieve
 
@@ -117,20 +117,31 @@ class AgentRuntime:
             return
 
         # ── 2. GATE — confidence check ────────────────────────────────────────
-        avg_score = (
-            sum(r["score"] for r in results) / len(results) if results else 0.0
-        )
+        # When semantic reranker is active, gate on reranker_score (0-4 scale).
+        # Otherwise gate on base RRF/hybrid score (0.01-0.033 scale).
+        has_reranker = bool(results) and results[0].get("reranker_score") is not None
+        if has_reranker:
+            avg_effective = (
+                sum(r.get("reranker_score") or 0 for r in results) / len(results)
+            )
+            gate_threshold = MIN_RERANKER_SCORE
+        else:
+            avg_effective = (
+                sum(r["score"] for r in results) / len(results) if results else 0.0
+            )
+            gate_threshold = MIN_AVG_SCORE
 
         if TRACE_MODE:
             logger.info(
-                "TRACE | n_results=%d  avg_score=%.4f  gate=(%d results, %.2f score)",
-                len(results), avg_score, MIN_RESULTS, MIN_AVG_SCORE,
+                "TRACE | n_results=%d  avg_effective=%.4f  gate=(>=%d results, >=%.3f)  "
+                "semantic_reranker=%s",
+                len(results), avg_effective, MIN_RESULTS, gate_threshold, has_reranker,
             )
 
-        if len(results) < MIN_RESULTS or avg_score < MIN_AVG_SCORE:
+        if len(results) < MIN_RESULTS or avg_effective < gate_threshold:
             logger.info(
-                "Gate: insufficient evidence (n=%d avg=%.4f threshold_n=%d threshold_avg=%.2f)",
-                len(results), avg_score, MIN_RESULTS, MIN_AVG_SCORE,
+                "Gate: insufficient evidence (n=%d avg=%.4f threshold_n=%d threshold=%.3f)",
+                len(results), avg_effective, MIN_RESULTS, gate_threshold,
             )
             yield _sse_data(
                 "I don't have enough evidence from the technical manuals to answer "

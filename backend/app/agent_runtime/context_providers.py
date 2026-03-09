@@ -1,24 +1,30 @@
 """ContextProvider — formats retrieved evidence into grounded prompt context.
 
-Mirrors the AIContextProvider pattern from Microsoft's agent framework:
-each retrieved chunk is labeled with its source metadata (source file,
-page, URL, chunk ID) so the LLM can cite it accurately and the user can
-trace every claim back to a specific page.
+Each retrieved chunk is formatted as a numbered evidence block containing
+title, source file, section breadcrumb, URL, chunk ID, and the chunk content.
+ocr_fallback_text is intentionally excluded — the LLM receives only the
+structured layout-extracted chunk text.
 """
+
+
+def _section_path(r: dict) -> str:
+    """Build a readable section breadcrumb from header_1/2/3 fields."""
+    parts = [r.get("section1") or "", r.get("section2") or "", r.get("section3") or ""]
+    return " > ".join(p for p in parts if p)
 
 
 def build_context_blocks(results: list[dict]) -> str:
     """Format retrieved chunks into numbered, labeled evidence blocks.
 
-    Each block carries a header with source metadata and the raw chunk
-    content below it. The LLM prompt instructs the model to answer only
-    from these blocks and to reference them by their [N] label.
+    Each block carries a header with source metadata followed by the raw chunk
+    content. The LLM prompt instructs the model to answer only from these blocks
+    and to reference them by their [N] label.
 
     Parameters
     ----------
     results:
-        Normalised result dicts from RetrievalTool — keys: content, source,
-        page, url, chunk_id, score.
+        Normalised result dicts from RetrievalTool — keys: content, title,
+        source, url, chunk_id, section1, section2, section3, score.
 
     Returns
     -------
@@ -28,14 +34,19 @@ def build_context_blocks(results: list[dict]) -> str:
     """
     blocks: list[str] = []
     for i, r in enumerate(results, start=1):
-        header_parts = [f"[{i}] Source: {r['source']}"]
-        if r.get("page"):
-            header_parts.append(f"Page: {r['page']}")
+        lines = [f"[{i}]"]
+        if r.get("title"):
+            lines.append(f"Title: {r['title']}")
+        lines.append(f"Source: {r['source']}")
+        section = _section_path(r)
+        if section:
+            lines.append(f"Section: {section}")
         if r.get("url"):
-            header_parts.append(f"URL: {r['url']}")
+            lines.append(f"URL: {r['url']}")
         if r.get("chunk_id"):
-            header_parts.append(f"ChunkID: {r['chunk_id']}")
-        header = " | ".join(header_parts)
-        blocks.append(f"{header}\n{r['content']}")
+            lines.append(f"Chunk ID: {r['chunk_id']}")
+        lines.append("Content:")
+        lines.append(r["content"])
+        blocks.append("\n".join(lines))
 
     return "\n\n---\n\n".join(blocks)

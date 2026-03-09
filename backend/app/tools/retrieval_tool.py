@@ -1,27 +1,20 @@
 """RetrievalTool — hybrid search against Azure AI Search.
 
-Implements the tool module pattern from Microsoft's agent framework:
-each tool is a pure function (or thin class) that does one thing.
-
 Pipeline inside retrieve():
   1. Distill the user's query: strip conversational filler so BM25 keyword
-     search focuses on technical terms (e.g. "Underground Plastic Piping
-     safety measures") not noise words ("Right now, I am installing…").
+     search focuses on technical terms.
      The original query is still used for vector embedding (semantic).
   2. Generate query embedding via Azure OpenAI (aoai_embeddings.embed).
   3. Issue a hybrid search against RETRIEVAL_CANDIDATES (wider pool):
-       keyword (distilled search_text) + vector (VectorizedQuery).
-  4. Optionally apply semantic reranking — falls back silently if unavailable.
+       keyword (distilled search_text) + vector (VectorizedQuery on text_vector).
+  4. Optionally apply semantic reranking with manual-semantic-config.
   5. Normalise raw Azure Search documents to a canonical dict schema.
-  6. Sort by relevance score descending.
-  7. Adaptive diversity filter:
-       - Detect a "dominant" source (its top score >= DOMINANT_SOURCE_SCORE_RATIO
-         × the next source's top score).
-       - Allow up to MAX_CHUNKS_DOMINANT_SOURCE chunks from the dominant source;
-         all others are still capped at MAX_CHUNKS_PER_SOURCE.
-  8. Score-gap filter: discard any remaining chunk whose score falls below
-     SCORE_GAP_MIN_RATIO × top_score — removes low-relevance cross-source noise.
-  9. Return at most TOP_K final results.
+  6. Sort by effective score: reranker_score when semantic is active,
+     base RRF score otherwise.
+  7. Filter TOC / index pages.
+  8. Adaptive diversity filter (dominant source gets higher cap).
+  9. Score-gap filter using effective score.
+ 10. Return at most TOP_K final results.
 
 The index is assumed to ALREADY EXIST — this module never creates or
 modifies the index.
@@ -50,7 +43,11 @@ from app.config.settings import (
     SEARCH_CONTENT_FIELD,
     SEARCH_FILENAME_FIELD,
     SEARCH_PAGE_FIELD,
-    SEARCH_SECTION_FIELD,
+    SEARCH_SECTION1_FIELD,
+    SEARCH_SECTION2_FIELD,
+    SEARCH_SECTION3_FIELD,
+    SEARCH_SEMANTIC_CONTENT_FIELD,
+    SEARCH_TITLE_FIELD,
     SEARCH_URL_FIELD,
     SEARCH_VECTOR_FIELD,
     SEMANTIC_CONFIG_NAME,
@@ -66,10 +63,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Query distillation — strip conversational filler before BM25 keyword search
 # ---------------------------------------------------------------------------
-# BM25 scores every token. Noise words ("Right now, I am installing…") dilute
-# the weight of the technical phrase ("Underground Plastic Piping safety").
-# We strip them so keyword search focuses on what matters.
-# Vector search still uses the original question (embeddings are semantic).
 _FILLER_RE = re.compile(
     r"\b(right now|currently|at this (moment|time)|i am|i'm|i need to|i want to|"
     r"can you|what should( i)?|how do i|what are the|please|tell me|help me|"
@@ -78,17 +71,15 @@ _FILLER_RE = re.compile(
 )
 
 # ---------------------------------------------------------------------------
-# Noise/TOC chunk detection
+# TOC/index chunk detection
 # ---------------------------------------------------------------------------
-# TOC pages score high on keyword search because they list exact section titles
-# (e.g. "Underground Plastic Piping . . . . . . 2-11"), but contain no real
-# procedural content. They confuse the LLM by making it think the context
-# is just an index with no instructions.
 _TOC_CHUNK_PATTERNS = [
     re.compile(r"Table\s+of\s+Contents", re.IGNORECASE),
     re.compile(r"(\. ){5,}"),          # dot leaders: ". . . . . . 2-11"
     re.compile(r"^Index\b", re.IGNORECASE | re.MULTILINE),
 ]
+
+_NUMBERED_SECTION_RE = re.compile(r"^\d+(\.\d+)*\s+\S")
 
 
 def _is_toc_chunk(content: str) -> bool:
@@ -97,36 +88,15 @@ def _is_toc_chunk(content: str) -> bool:
     return any(p.search(sample) for p in _TOC_CHUNK_PATTERNS)
 
 
-# ---------------------------------------------------------------------------
-# Heading extraction — detect section headings inside chunk content
-# ---------------------------------------------------------------------------
-# Technical manuals use numbered sections (7.1 Title), ALL-CAPS lines, or
-# short Title-Case lines as headings. We check the first 3 lines of each
-# chunk. Used in TRACE logging to identify which section a chunk belongs to.
-_NUMBERED_SECTION_RE = re.compile(r"^\d+(\.\d+)*\s+\S")
-
-
 def _distill_keyword_query(question: str) -> str:
-    """Remove conversational filler to improve BM25 keyword recall.
-
-    Returns the distilled string if it is still meaningful (≥10 chars);
-    otherwise falls back to the original to avoid an empty search_text.
-    """
+    """Remove conversational filler to improve BM25 keyword recall."""
     distilled = _FILLER_RE.sub(" ", question)
     distilled = re.sub(r"[,\s]+", " ", distilled).strip()
     return distilled if len(distilled) >= 10 else question
 
 
 def _extract_heading(content: str) -> str:
-    """Try to extract a section heading from the first few lines of a chunk.
-
-    Matches:
-    - Numbered sections: "7.1 Underground Gas Piping Installations"
-    - ALL-CAPS lines: "STORAGE AND HANDLING PRECAUTIONS"
-    - Short Title-Case lines: "Pressure Testing Requirements"
-
-    Returns the first matching line, or "" if none found.
-    """
+    """Extract a section heading from the first few lines of a chunk."""
     for line in content.strip().splitlines()[:4]:
         line = line.strip()
         if not line or len(line) > 80:
@@ -142,6 +112,16 @@ def _extract_heading(content: str) -> str:
     return ""
 
 
+def _effective_score(r: dict) -> float:
+    """Return the best available relevance score for sorting and gap-filtering.
+
+    When semantic reranker is active, reranker_score (0-4 scale) is used.
+    Otherwise the base RRF/hybrid score (0.01-0.033 scale) is used.
+    """
+    rs = r.get("reranker_score")
+    return rs if rs is not None else r["score"]
+
+
 def _get_search_client() -> SearchClient:
     return SearchClient(
         endpoint=AZURE_SEARCH_ENDPOINT,
@@ -151,53 +131,84 @@ def _get_search_client() -> SearchClient:
 
 
 def _select_fields() -> list[str]:
-    """Return only the fields that are configured (non-empty env values)."""
-    return [
-        f for f in [
-            SEARCH_CONTENT_FIELD,
-            SEARCH_FILENAME_FIELD,
-            SEARCH_PAGE_FIELD,
-            SEARCH_CHUNK_ID_FIELD,
-            SEARCH_URL_FIELD,
-            SEARCH_SECTION_FIELD,
-        ]
-        if f
+    """Return the list of index fields to retrieve.
+
+    Includes all schema fields needed for context building and citations.
+    Optional fields (SEARCH_PAGE_FIELD) are included only when non-empty.
+    text_vector is excluded — it is stored=false/not retrievable.
+    """
+    fields = [
+        SEARCH_CONTENT_FIELD,
+        SEARCH_SEMANTIC_CONTENT_FIELD,
+        SEARCH_TITLE_FIELD,
+        SEARCH_FILENAME_FIELD,
+        SEARCH_URL_FIELD,
+        SEARCH_CHUNK_ID_FIELD,
+        SEARCH_SECTION1_FIELD,
+        SEARCH_SECTION2_FIELD,
+        SEARCH_SECTION3_FIELD,
+        # Schema-fixed fields not exposed as env vars
+        "parent_id",
+        "layout_ordinal",
     ]
+    if SEARCH_PAGE_FIELD:
+        fields.append(SEARCH_PAGE_FIELD)
+    # Filter out any blank values (optional fields left empty in .env)
+    return [f for f in fields if f]
 
 
 def _normalize(doc: dict) -> dict:
-    """Map a raw Azure Search document to the canonical result schema."""
+    """Map a raw Azure Search document to the canonical result schema.
+
+    Returns
+    -------
+    dict with keys:
+        content          -- main chunk text passed to the LLM
+        semantic_content -- chunk_for_semantic (stored, not sent to LLM directly)
+        title            -- document title
+        source           -- source filename
+        url              -- blob URL
+        chunk_id         -- unique chunk key
+        parent_id        -- parent document key
+        section1/2/3     -- header_1/2/3 breadcrumb fields
+        layout_ordinal   -- section ordering within the document
+        page             -- page number string (empty if SEARCH_PAGE_FIELD not set)
+        score            -- base RRF/hybrid search score
+        reranker_score   -- semantic reranker score (None if reranker not used)
+    """
     return {
-        "content": doc.get(SEARCH_CONTENT_FIELD) or "",
-        "source": doc.get(SEARCH_FILENAME_FIELD) or "",
-        "page": str(doc.get(SEARCH_PAGE_FIELD) or ""),
-        "url": doc.get(SEARCH_URL_FIELD) or "",
-        "chunk_id": doc.get(SEARCH_CHUNK_ID_FIELD) or "",
-        "score": doc.get("@search.score") or 0.0,
+        "content":          doc.get(SEARCH_CONTENT_FIELD) or "",
+        "semantic_content": doc.get(SEARCH_SEMANTIC_CONTENT_FIELD) or "",
+        "title":            doc.get(SEARCH_TITLE_FIELD) or "",
+        "source":           doc.get(SEARCH_FILENAME_FIELD) or "",
+        "url":              doc.get(SEARCH_URL_FIELD) or "",
+        "chunk_id":         doc.get(SEARCH_CHUNK_ID_FIELD) or "",
+        "parent_id":        doc.get("parent_id") or "",
+        "section1":         doc.get(SEARCH_SECTION1_FIELD) or "",
+        "section2":         doc.get(SEARCH_SECTION2_FIELD) or "",
+        "section3":         doc.get(SEARCH_SECTION3_FIELD) or "",
+        "layout_ordinal":   doc.get("layout_ordinal"),
+        "page":             str(doc.get(SEARCH_PAGE_FIELD) or "") if SEARCH_PAGE_FIELD else "",
+        "score":            doc.get("@search.score") or 0.0,
+        "reranker_score":   doc.get("@search.reranker_score"),  # None when not used
     }
 
 
 def _adaptive_diversity(results: list[dict]) -> list[dict]:
     """Adaptive per-source cap that rewards a clearly dominant source.
 
-    Standard behaviour (no dominant source): cap every source at
-    MAX_CHUNKS_PER_SOURCE (default 2).
-
-    Dominant-source behaviour: if one source's top score is >=
-    DOMINANT_SOURCE_SCORE_RATIO × the next source's top score, that source
-    may contribute up to MAX_CHUNKS_DOMINANT_SOURCE chunks (default 4).
-    This lets the clearly-matching manual (e.g. gas_appliances_gas_piping.pdf)
-    provide fuller grounding context instead of being truncated at 2.
+    Standard: cap every source at MAX_CHUNKS_PER_SOURCE.
+    Dominant: if one source's top effective score >= DOMINANT_SOURCE_SCORE_RATIO
+    x the next source's top score, allow up to MAX_CHUNKS_DOMINANT_SOURCE from it.
     """
     if not results:
         return results
 
-    # Find the best score per source (results are already sorted descending)
     source_top: dict[str, float] = {}
     for r in results:
         src = r["source"]
         if src not in source_top:
-            source_top[src] = r["score"]
+            source_top[src] = _effective_score(r)
 
     sorted_sources = sorted(source_top.items(), key=lambda x: x[1], reverse=True)
     dominant_source = sorted_sources[0][0]
@@ -213,7 +224,7 @@ def _adaptive_diversity(results: list[dict]) -> list[dict]:
     if TRACE_MODE:
         ratio_str = (
             f"{dominant_score / second_score:.2f}x"
-            if second_score > 0 else "∞"
+            if second_score > 0 else "inf"
         )
         logger.info(
             "TRACE | dominant_source=%s  score_ratio=%s  dominant=%s  cap=%d",
@@ -232,30 +243,26 @@ def _adaptive_diversity(results: list[dict]) -> list[dict]:
 
 
 def _filter_score_gap(results: list[dict]) -> list[dict]:
-    """Remove chunks that score below SCORE_GAP_MIN_RATIO × top_score.
+    """Remove chunks whose effective score falls below SCORE_GAP_MIN_RATIO x top.
 
-    After diversity filtering, secondary-source chunks may remain that are far
-    less relevant than the best chunk. These add noise to the LLM context and
-    can cause the model to cite wrong documents or extrapolate from them.
-
-    Example: gas_appliances top=0.0333, PEPP=0.0167 → ratio 0.50.
-    With SCORE_GAP_MIN_RATIO=0.55, the PEPP chunk is removed (0.50 < 0.55).
+    Uses effective score (reranker when available) so the filter is consistent
+    with the sort order.
     """
     if not results or SCORE_GAP_MIN_RATIO <= 0:
         return results
 
-    top_score = results[0]["score"]
+    top_score = _effective_score(results[0])
     if top_score == 0:
         return results
 
     threshold = SCORE_GAP_MIN_RATIO * top_score
-    filtered = [r for r in results if r["score"] >= threshold]
+    filtered = [r for r in results if _effective_score(r) >= threshold]
 
     removed = len(results) - len(filtered)
     if TRACE_MODE and removed:
         logger.info(
             "TRACE | score_gap_filter: removed %d chunk(s) below %.4f "
-            "(%.0f%% of top score %.4f)",
+            "(%.0f%% of top %.4f)",
             removed, threshold, SCORE_GAP_MIN_RATIO * 100, top_score,
         )
     return filtered
@@ -267,24 +274,22 @@ def retrieve(question: str, top_k: int = TOP_K) -> list[dict]:
     Parameters
     ----------
     question:
-        The user's question. Used verbatim for vector embedding (semantic).
-        A distilled version (conversational filler stripped) is used for
-        the BM25 keyword search so technical terms score higher.
+        The user's question. Used verbatim for vector embedding.
+        A distilled version is used for BM25 keyword search.
     top_k:
         Maximum number of chunks to return after all filters.
 
     Returns
     -------
     list[dict]
-        Normalised result dicts with keys: content, source, page, url,
-        chunk_id, score. Ordered by relevance score descending.
+        Normalised result dicts ordered by effective relevance score descending.
     """
-    # ── 1. Distill keyword query (keep original for vector embedding) ─────────
+    # ── 1. Distill keyword query ──────────────────────────────────────────────
     keyword_query = _distill_keyword_query(question)
     if TRACE_MODE and keyword_query != question:
         logger.info("TRACE | keyword_query=%r", keyword_query)
 
-    # ── 2. Generate query embedding (uses original question, not distilled) ───
+    # ── 2. Generate query embedding (original question, not distilled) ────────
     query_vector: list[float] | None = None
     try:
         query_vector = embed(question)
@@ -294,8 +299,6 @@ def retrieve(question: str, top_k: int = TOP_K) -> list[dict]:
         )
 
     # ── 3. Build search arguments ─────────────────────────────────────────────
-    # Ask for RETRIEVAL_CANDIDATES from the index (wider pool so diversity
-    # filter has more to work with); trim to top_k after all filters.
     client = _get_search_client()
     select = _select_fields()
 
@@ -337,13 +340,13 @@ def retrieve(question: str, top_k: int = TOP_K) -> list[dict]:
     else:
         raw_results = list(client.search(**search_kwargs))
 
-    # ── 5. Normalise and sort ─────────────────────────────────────────────────
+    # ── 5. Normalise and sort by effective score ──────────────────────────────
+    # Sort by reranker_score when semantic is on (Azure returns results already
+    # in reranker order, but re-sort after normalisation to be explicit).
     results = [_normalize(doc) for doc in raw_results]
-    results.sort(key=lambda r: r["score"], reverse=True)
+    results.sort(key=_effective_score, reverse=True)
 
     # ── 5b. Filter TOC / index pages ─────────────────────────────────────────
-    # TOC pages score high because they list exact section titles as keywords,
-    # but they contain no procedural content and confuse the LLM.
     before_toc = len(results)
     results = [r for r in results if not _is_toc_chunk(r["content"])]
     if TRACE_MODE and len(results) < before_toc:
@@ -352,25 +355,32 @@ def retrieve(question: str, top_k: int = TOP_K) -> list[dict]:
             before_toc - len(results),
         )
 
-    # ── 6. Adaptive diversity filter (dominant source gets higher cap) ────────
+    # ── 6. Adaptive diversity filter ─────────────────────────────────────────
     if DIVERSITY_BY_SOURCE:
         results = _adaptive_diversity(results)
 
-    # ── 7. Score-gap filter (remove low-relevance cross-source noise) ─────────
+    # ── 7. Score-gap filter ───────────────────────────────────────────────────
     results = _filter_score_gap(results)
 
     # ── 8. Trim to top_k ──────────────────────────────────────────────────────
     results = results[:top_k]
 
-    # ── 9. Trace logging — ranked chunks with heading, source, score, preview ─
+    # ── 9. Trace logging ──────────────────────────────────────────────────────
     if TRACE_MODE:
         logger.info("TRACE | final_chunks=%d (top_k=%d)", len(results), top_k)
         for i, r in enumerate(results, start=1):
             heading = _extract_heading(r["content"])
+            section_parts = [r["section1"], r["section2"], r["section3"]]
+            section = " > ".join(p for p in section_parts if p)
+            reranker_str = (
+                f"  reranker={r['reranker_score']:.4f}"
+                if r.get("reranker_score") is not None else ""
+            )
             preview = r["content"][:120].replace("\n", " ")
             logger.info(
-                "TRACE | [%d] source=%s  page=%s  score=%.4f  heading=%r | %s",
-                i, r["source"], r["page"], r["score"], heading, preview,
+                "TRACE | [%d] source=%s  ordinal=%s  score=%.4f%s  section=%r | %s",
+                i, r["source"], r["layout_ordinal"], r["score"],
+                reranker_str, section, preview,
             )
 
     return results

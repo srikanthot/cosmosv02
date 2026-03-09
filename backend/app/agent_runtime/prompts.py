@@ -24,8 +24,9 @@ RULES:
    specifications in the context all count as relevant technical guidance.
 6. At the end of your answer, include a "Sources:" section listing every source cited:
      Sources:
-     - <document name> (p.<page>)
-   If page is unavailable, list the document name only.
+     - <document name>
+     - <document name>, Section: <section if available>
+   Use the Title and Source fields from the context blocks.
 7. Keep answers concise and actionable — field technicians need clear step-by-step guidance.
 """
 

@@ -134,18 +134,27 @@ def render_citations(citations: list) -> None:
     with st.expander(f"📚 Sources ({len(citations)})", expanded=False):
         for i, c in enumerate(citations, 1):
             source = c.get("source", "Unknown")
+            title = c.get("title", "")
+            section = c.get("section", "")
             page = c.get("page", "")
             url = c.get("url", "")
             chunk_id = c.get("chunk_id", "")
 
-            label = f"**{i}.** {source}"
+            # Show title if available; fall back to source filename
+            display_name = title if title else source
+            label = f"**{i}.** {display_name}"
+            # Show filename separately if it differs from the title
+            if title and title != source:
+                label += f"  _(file: {source})_"
+            if section:
+                label += f"\n\n  > {section}"
             if page:
                 label += f" — p.{page}"
             if chunk_id:
                 label += f"  `{chunk_id}`"
 
             if url:
-                st.markdown(f"{label}  \n[{url}]({url})")
+                st.markdown(f"{label}  \n[View source]({url})")
             else:
                 st.markdown(label)
 
