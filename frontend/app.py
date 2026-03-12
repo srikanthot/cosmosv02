@@ -1,4 +1,10 @@
-"""PSEG Tech Manual Agent — Streamlit chat UI."""
+"""PSEG Tech Manual Agent — Streamlit chat UI.
+
+Connects to the FastAPI backend via Server-Sent Events (SSE).
+Tokens stream live into the chat bubble. Citations arrive as a named
+SSE event at the end and render as a collapsible "Sources" panel.
+Keepalive ping events are consumed silently.
+"""
 
 import json
 import os
@@ -11,9 +17,10 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 _backend_port = os.getenv("BACKEND_PORT", "8000")
-BACKEND_URL = os.getenv("BACKEND_URL", f"http://localhost:{_backend_port}")
+BACKEND_URL = os.getenv("BACKEND_URL", f"http://localhost:{_backend_port}").rstrip("/")
 FRONTEND_TITLE = os.getenv("FRONTEND_TITLE", "PSEG Tech Manual Agent")
 
+# ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title=FRONTEND_TITLE,
     page_icon="⚡",
@@ -21,6 +28,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# ── Global CSS ─────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
     :root {
@@ -61,7 +69,6 @@ st.markdown("""
         border: 2px solid var(--border) !important;
         border-radius: 12px !important;
     }
-
     [data-testid="stChatInput"]:focus-within {
         border-color: var(--navy) !important;
     }
@@ -77,15 +84,61 @@ st.markdown("""
     [data-testid="stSidebar"] { background: var(--card) !important; }
 
     .stSpinner > div { border-top-color: var(--orange) !important; }
+
+    hr { border: none; height: 1px; background: #edf2f7; margin: 1rem 0; }
 </style>
 """, unsafe_allow_html=True)
 
+# ── Session state ──────────────────────────────────────────────────────────────
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "session_id" not in st.session_state:
     st.session_state.session_id = str(uuid.uuid4())
 
 
+# ── SSE consumer ──────────────────────────────────────────────────────────────
+def _token_stream(response: requests.Response, citations_out: list):
+    """Parse SSE manually from requests.iter_lines()."""
+    current_event = "message"
+    data_lines = []
+
+    for raw_line in response.iter_lines(decode_unicode=True):
+        if raw_line is None:
+            continue
+
+        line = raw_line.strip()
+
+        if line == "":
+            if data_lines:
+                data = "\n".join(data_lines)
+
+                if current_event == "citations":
+                    try:
+                        payload = json.loads(data)
+                        citations_out.extend(payload.get("citations", []))
+                    except json.JSONDecodeError:
+                        pass
+
+                elif current_event == "ping":
+                    pass
+
+                elif data == "[DONE]":
+                    break
+
+                else:
+                    yield data.replace("\\n", "\n")
+
+            current_event = "message"
+            data_lines = []
+            continue
+
+        if line.startswith("event:"):
+            current_event = line[len("event:"):].strip()
+        elif line.startswith("data:"):
+            data_lines.append(line[len("data:"):].strip())
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
 def render_citations(citations: list) -> None:
     with st.expander(f"📚 Sources ({len(citations)})", expanded=False):
         for i, c in enumerate(citations, 1):
@@ -121,8 +174,35 @@ def render_history() -> None:
                 render_citations(msg["citations"])
 
 
+# ── Sidebar ────────────────────────────────────────────────────────────────────
 def render_sidebar() -> None:
     with st.sidebar:
+        st.markdown("""
+        <div style="text-align:center; padding: 0.75rem 0 0.5rem;">
+            <svg viewBox="0 0 160 55" xmlns="http://www.w3.org/2000/svg"
+                 style="height:50px; width:auto;">
+                <circle cx="28" cy="28" r="24" fill="#f26522"/>
+                <g fill="white">
+                    <polygon points="28,8 29.5,17 26.5,17"/>
+                    <polygon points="28,8 29.5,17 26.5,17" transform="rotate(30,28,28)"/>
+                    <polygon points="28,8 29.5,17 26.5,17" transform="rotate(60,28,28)"/>
+                    <polygon points="28,8 29.5,17 26.5,17" transform="rotate(90,28,28)"/>
+                    <polygon points="28,8 29.5,17 26.5,17" transform="rotate(120,28,28)"/>
+                    <polygon points="28,8 29.5,17 26.5,17" transform="rotate(150,28,28)"/>
+                    <polygon points="28,8 29.5,17 26.5,17" transform="rotate(180,28,28)"/>
+                    <polygon points="28,8 29.5,17 26.5,17" transform="rotate(210,28,28)"/>
+                    <polygon points="28,8 29.5,17 26.5,17" transform="rotate(240,28,28)"/>
+                    <polygon points="28,8 29.5,17 26.5,17" transform="rotate(270,28,28)"/>
+                    <polygon points="28,8 29.5,17 26.5,17" transform="rotate(300,28,28)"/>
+                    <polygon points="28,8 29.5,17 26.5,17" transform="rotate(330,28,28)"/>
+                </g>
+                <circle cx="28" cy="28" r="6" fill="white"/>
+                <text x="62" y="36" font-family="Arial,sans-serif" font-size="26"
+                      font-weight="bold" fill="#1e3a5f">PSEG</text>
+            </svg>
+        </div>
+        """, unsafe_allow_html=True)
+
         st.markdown("**Tech Manual Agent**")
         st.caption("Powered by Azure AI · GCC High")
         st.markdown("---")
@@ -148,11 +228,13 @@ def render_sidebar() -> None:
         st.caption(f"Session `{st.session_state.session_id[:8]}…`")
 
 
+# ── Header ─────────────────────────────────────────────────────────────────────
 def render_header() -> None:
     st.markdown("""
     <div style="background: linear-gradient(135deg, #1e3a5f 0%, #2d5a87 100%);
                 border-radius: 16px; padding: 1.25rem 2rem; margin-bottom: 1.25rem;
-                border-bottom: 4px solid #f26522;">
+                border-bottom: 4px solid #f26522;
+                box-shadow: 0 6px 20px rgba(30,58,95,0.12);">
         <div style="font-size:1.3rem; font-weight:700; color:white; margin-bottom:4px;">
             ⚡ Tech Manual Agent
         </div>
@@ -164,6 +246,7 @@ def render_header() -> None:
     """, unsafe_allow_html=True)
 
 
+# ── Main ───────────────────────────────────────────────────────────────────────
 def main() -> None:
     render_sidebar()
     render_header()
@@ -175,12 +258,14 @@ def main() -> None:
             st.markdown(prompt)
 
         with st.chat_message("assistant"):
-            full_answer = ""
-            citations_captured = []
+            citations_captured: list = []
+            full_answer: str = ""
 
             try:
+                chat_url = f"{BACKEND_URL}/chat/stream"
+
                 resp = requests.post(
-                    f"{BACKEND_URL}/chat/stream",
+                    chat_url,
                     json={
                         "question": prompt,
                         "session_id": st.session_state.session_id,
@@ -194,45 +279,52 @@ def main() -> None:
                     allow_redirects=False,
                 )
 
-                history_info = []
-                for h in resp.history:
-                    history_info.append({
-                        "status_code": h.status_code,
-                        "method": h.request.method,
-                        "url": h.url,
-                        "location": h.headers.get("Location"),
-                    })
-
-                request_method = getattr(resp.request, "method", "<unknown>")
-                request_url = getattr(resp.request, "url", "<unknown>")
-
                 if resp.status_code >= 400:
                     try:
                         error_body = resp.text[:1500]
                     except Exception:
                         error_body = "<no response body>"
 
+                    try:
+                        response_headers = dict(resp.headers)
+                    except Exception:
+                        response_headers = {}
+
+                    request_method = getattr(resp.request, "method", "<unknown>")
+                    request_url = getattr(resp.request, "url", "<unknown>")
+
                     full_answer = (
                         f"Backend error: HTTP {resp.status_code}\n\n"
-                        f"Final request method: {request_method}\n\n"
-                        f"Final request URL: {request_url}\n\n"
+                        f"Request method: {request_method}\n\n"
+                        f"Request URL: {request_url}\n\n"
                         f"Response URL: {resp.url}\n\n"
-                        f"Redirect history: {history_info}\n\n"
-                        f"Response headers: {dict(resp.headers)}\n\n"
+                        f"Response headers: {response_headers}\n\n"
                         f"Response body:\n{error_body}"
                     )
                     st.error(full_answer)
                 else:
-                    full_answer = (
-                        f"Request reached backend successfully.\n\n"
-                        f"Final request method: {request_method}\n\n"
-                        f"Final request URL: {request_url}\n\n"
-                        f"Response URL: {resp.url}\n\n"
-                        f"Redirect history: {history_info}\n\n"
-                        f"Status: {resp.status_code}\n\n"
-                        f"Content-Type: {resp.headers.get('Content-Type')}"
-                    )
-                    st.success(full_answer)
+                    full_answer = st.write_stream(
+                        _token_stream(resp, citations_captured)
+                    ) or ""
+
+                    if not full_answer.strip():
+                        try:
+                            fallback_text = resp.text[:1500]
+                        except Exception:
+                            fallback_text = "<empty streamed response>"
+                        st.warning(f"No tokens rendered. Raw response preview:\n{fallback_text}")
+
+                    if citations_captured:
+                        st.markdown("---")
+                        render_citations(citations_captured)
+
+            except requests.exceptions.ConnectionError:
+                full_answer = f"Cannot connect to backend at `{BACKEND_URL}`. Is it running?"
+                st.error(full_answer)
+
+            except requests.exceptions.Timeout:
+                full_answer = "Request timed out. Please try again."
+                st.error(full_answer)
 
             except Exception as e:
                 full_answer = f"Unexpected error: {e}"
