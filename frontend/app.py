@@ -120,12 +120,10 @@ def _token_stream(
             except json.JSONDecodeError:
                 pass
         elif event.event == "ping":
-            # Keepalive — discard silently
             continue
         elif event.data == "[DONE]":
             break
         else:
-            # Decode the \\n encoding the backend uses for newlines in SSE
             yield event.data.replace("\\n", "\n")
 
 
@@ -141,10 +139,8 @@ def render_citations(citations: list) -> None:
             url = c.get("url", "")
             chunk_id = c.get("chunk_id", "")
 
-            # Show title if available; fall back to source filename
             display_name = title if title else source
             label = f"**{i}.** {display_name}"
-            # Show filename separately if it differs from the title
             if title and title != source:
                 label += f"  _(file: {source})_"
             if section:
@@ -248,12 +244,10 @@ def main() -> None:
     render_history()
 
     if prompt := st.chat_input("Ask a question about PSEG technical manuals…"):
-        # Show user message immediately
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
 
-        # Stream assistant response
         with st.chat_message("assistant"):
             citations_captured: list = []
             full_answer: str = ""
@@ -265,19 +259,41 @@ def main() -> None:
                         "question": prompt,
                         "session_id": st.session_state.session_id,
                     },
+                    headers={
+                        "Accept": "text/event-stream",
+                        "Content-Type": "application/json",
+                    },
                     stream=True,
                     timeout=120,
+                    allow_redirects=False,
                 )
-                resp.raise_for_status()
 
-                # st.write_stream renders tokens live and returns the full text
-                full_answer = st.write_stream(
-                    _token_stream(resp, citations_captured)
-                ) or ""
+                if resp.status_code >= 400:
+                    try:
+                        error_body = resp.text[:1500]
+                    except Exception:
+                        error_body = "<no response body>"
 
-                if citations_captured:
-                    st.markdown("---")
-                    render_citations(citations_captured)
+                    try:
+                        response_headers = dict(resp.headers)
+                    except Exception:
+                        response_headers = {}
+
+                    full_answer = (
+                        f"Backend error: HTTP {resp.status_code}\n\n"
+                        f"URL: {resp.url}\n\n"
+                        f"Response headers: {response_headers}\n\n"
+                        f"Response body:\n{error_body}"
+                    )
+                    st.error(full_answer)
+                else:
+                    full_answer = st.write_stream(
+                        _token_stream(resp, citations_captured)
+                    ) or ""
+
+                    if citations_captured:
+                        st.markdown("---")
+                        render_citations(citations_captured)
 
             except requests.exceptions.ConnectionError:
                 full_answer = (
@@ -297,7 +313,6 @@ def main() -> None:
                 full_answer = f"Unexpected error: {e}"
                 st.error(full_answer)
 
-            # Persist to session state for history rendering
             st.session_state.messages.append({
                 "role": "assistant",
                 "content": full_answer,
