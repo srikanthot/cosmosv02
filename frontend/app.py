@@ -4,11 +4,11 @@ import requests
 import streamlit as st
 from dotenv import load_dotenv
 
-load_dotenv(override=True)
+load_dotenv()
 
 _backend_port = os.getenv("BACKEND_PORT", "8000")
-BACKEND_URL = os.getenv("BACKEND_URL", f"http://localhost:{_backend_port}").rstrip("/")
-FRONTEND_TITLE = os.getenv("FRONTEND_TITLE", "PACG Tech Manual Agent Chatbot Prototype")
+BACKEND_URL = os.getenv("BACKEND_URL", f"http://localhost:{_backend_port}").strip().rstrip("/")
+FRONTEND_TITLE = os.getenv("FRONTEND_TITLE", "PSEG Tech Manual Chatbot Prototype")
 APP_VERSION = "frontend-json-v3"
 FEEDBACK_FORM_URL = os.getenv("FEEDBACK_FORM_URL", "").strip()
 
