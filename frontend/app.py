@@ -15,7 +15,6 @@ State keys (all initialized in _init_state()):
 """
 
 import time
-import uuid
 from datetime import datetime, timezone
 
 import streamlit as st
@@ -214,11 +213,19 @@ def _select_thread(thread_id: str) -> None:
 
 
 def _new_chat() -> None:
-    """Create a new thread UUID locally; backend creates the record on first message."""
-    new_id = str(uuid.uuid4())
-    st.session_state.current_thread_id = new_id
-    st.session_state._loaded_thread_id = new_id  # nothing to load from backend yet
+    """Create a new conversation thread on the backend and activate it."""
+    conv = api.create_conversation()
+    if conv is None:
+        st.error(
+            "Could not create a new conversation — backend may be unavailable. "
+            "Check the status badge in the sidebar."
+        )
+        return
+    thread_id = conv["thread_id"]
+    st.session_state.current_thread_id = thread_id
+    st.session_state._loaded_thread_id = thread_id  # empty thread, nothing to load
     st.session_state.messages = []
+    st.session_state._need_conv_refresh = True
 
 
 def _delete_thread(thread_id: str) -> None:
@@ -495,33 +502,53 @@ def _format_send_error(exc: Exception) -> str:
 def _handle_send(question: str) -> None:
     thread_id = st.session_state.current_thread_id
 
+    # If somehow no thread is active, create one now before sending.
+    if not thread_id:
+        conv = api.create_conversation()
+        if conv is None:
+            st.error("Cannot send — could not create a conversation thread. Is the backend running?")
+            return
+        thread_id = conv["thread_id"]
+        st.session_state.current_thread_id = thread_id
+        st.session_state._loaded_thread_id = thread_id
+        st.session_state._need_conv_refresh = True
+
     # Add user message to state immediately (already rendered above input)
     st.session_state.messages.append({"role": "user", "content": question, "citations": []})
 
+    answer_tokens: list[str] = []
+    citations: list = []
+
     with st.chat_message("assistant"):
-        with st.spinner("Getting answer…"):
-            try:
-                answer, citations, returned_thread_id = api.send_message(question, thread_id)
+        placeholder = st.empty()
+        try:
+            for event in api.send_message_stream(question, thread_id):
+                if event["type"] == "token":
+                    answer_tokens.append(event["text"])
+                    placeholder.markdown("".join(answer_tokens) + " ▌")
+                elif event["type"] == "citations":
+                    citations = event["citations"]
+                elif event["type"] == "done":
+                    break
 
-                # Keep thread_id in sync if backend assigned one
-                if returned_thread_id and returned_thread_id != thread_id:
-                    st.session_state.current_thread_id = returned_thread_id
-                    st.session_state._loaded_thread_id = returned_thread_id
+            answer = "".join(answer_tokens)
+            if not answer:
+                answer = "No answer returned from backend."
 
-                st.markdown(answer)
-                if citations:
-                    _render_citations(citations)
+            placeholder.markdown(answer)
+            if citations:
+                _render_citations(citations)
 
-                st.session_state.messages.append(
-                    {"role": "assistant", "content": answer, "citations": citations}
-                )
+            st.session_state.messages.append(
+                {"role": "assistant", "content": answer, "citations": citations}
+            )
 
-            except Exception as exc:
-                err_msg = _format_send_error(exc)
-                st.error(err_msg)
-                st.session_state.messages.append(
-                    {"role": "assistant", "content": err_msg, "citations": []}
-                )
+        except Exception as exc:
+            err_msg = _format_send_error(exc)
+            placeholder.error(err_msg)
+            st.session_state.messages.append(
+                {"role": "assistant", "content": err_msg, "citations": []}
+            )
 
     # Refresh conversation list so updated title/preview appears in sidebar
     st.session_state._need_conv_refresh = True

@@ -199,3 +199,75 @@ def send_message(question: str, thread_id: str) -> tuple[str, list, str]:
         data.get("thread_id") or data.get("session_id") or thread_id
     )
     return answer, citations, returned_thread_id
+
+
+def send_message_stream(question: str, thread_id: str):
+    """Stream a question to /chat/stream and yield structured events.
+
+    Yields dicts:
+        {"type": "token",     "text": "..."}
+        {"type": "citations", "citations": [...]}
+        {"type": "done"}
+
+    Raises:
+        RuntimeError:   if the HTTP response is not 200
+        requests.*:     on network failures (ConnectionError, Timeout, etc.)
+    """
+    import json as _json
+
+    stream_headers = {**_headers(), "Accept": "text/event-stream"}
+    r = requests.post(
+        f"{BACKEND_URL}/chat/stream",
+        json={"question": question, "session_id": thread_id},
+        headers=stream_headers,
+        timeout=_T_CHAT,
+        stream=True,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"Backend returned HTTP {r.status_code}:\n{r.text[:600]}")
+
+    current_event: str | None = None
+
+    for raw_line in r.iter_lines(decode_unicode=True):
+        if raw_line is None:
+            continue
+        line: str = raw_line
+
+        # Named event line: "event: <name>"
+        if line.startswith("event:"):
+            current_event = line[len("event:"):].strip()
+            continue
+
+        # Data line: "data: <payload>"
+        if line.startswith("data:"):
+            payload = line[len("data:"):].strip()
+
+            if current_event == "citations":
+                try:
+                    obj = _json.loads(payload)
+                    yield {"type": "citations", "citations": obj.get("citations", [])}
+                except Exception:
+                    yield {"type": "citations", "citations": []}
+                current_event = None
+                continue
+
+            if current_event == "ping":
+                current_event = None
+                continue
+
+            # Regular token data (no named event)
+            current_event = None
+
+            if payload == "[DONE]":
+                yield {"type": "done"}
+                return
+
+            # Unescape newlines encoded by the backend (\n → real newline)
+            text = payload.replace("\\n", "\n")
+            if text:
+                yield {"type": "token", "text": text}
+            continue
+
+        # Blank line resets the event name boundary
+        if line == "":
+            current_event = None
