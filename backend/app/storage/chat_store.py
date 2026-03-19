@@ -33,7 +33,6 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import datetime, timezone
 from typing import Optional
 
 from azure.core.conditions import MatchConditions
@@ -44,7 +43,7 @@ from app.storage.cosmos_client import (
     get_messages_container,
     is_storage_enabled,
 )
-from app.storage.models import ConversationRecord, MessageRecord
+from app.storage.models import ConversationRecord, MessageRecord, _utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -55,10 +54,6 @@ _MAX_CAS_RETRIES = 5
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
-
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
 
 def _utcnow_iso() -> str:
     return _utcnow().isoformat()
@@ -126,6 +121,7 @@ async def create_conversation(
     user_id: str,
     user_name: str = "",
     title: str = "New Chat",
+    metadata: Optional[dict] = None,
 ) -> Optional[ConversationRecord]:
     """Create and persist a new conversation document. Returns None if storage disabled."""
     if not is_storage_enabled():
@@ -138,6 +134,7 @@ async def create_conversation(
         user_id=user_id,
         user_name=user_name,
         title=title,
+        metadata=metadata or {},
     )
     try:
         await container.upsert_item(body=conv.model_dump(mode="json"))
@@ -271,7 +268,8 @@ async def _append_message(
     role: str,
     content: str,
     citations: Optional[list[dict]] = None,
-    status: str = "complete",
+    status: str = "completed",
+    metadata: Optional[dict] = None,
 ) -> Optional[MessageRecord]:
     """Atomically reserve the next sequence number and persist a message.
 
@@ -291,9 +289,17 @@ async def _append_message(
       5. Once the sequence slot is reserved, upsert the message document.
          Message documents use UUID ids so concurrent messages never collide.
 
-    If the message upsert fails after a successful sequence reservation, the
-    sequence slot is lost (message_count is ahead by one) — this is logged
-    explicitly so it can be detected and the count corrected if needed.
+    Consistency note:
+      The CAS loop reserves a sequence slot by updating the conversation doc,
+      then separately upserts the message document.  These are two independent
+      writes — not a Cosmos DB transaction.  If the message upsert fails after
+      the CAS replace succeeds, message_count in the conversation will be one
+      ahead of the actual message count.  This is logged as an explicit ERROR
+      so it can be detected and manually corrected if needed.  The risk is low
+      (transient storage errors) but it cannot be fully eliminated without
+      server-side Cosmos transactions (not supported by the SDK's async client
+      in a cross-container scenario).  For production use, consider idempotent
+      message IDs and a reconciliation job.
     """
     if not is_storage_enabled():
         return None
@@ -379,6 +385,7 @@ async def _append_message(
             citations=citations or [],
             sequence=sequence,
             status=status,
+            metadata=metadata or {},
         )
         try:
             await msg_container.upsert_item(body=msg.model_dump(mode="json"))
@@ -417,12 +424,13 @@ async def append_assistant_message(
     user_id: str,
     content: str,
     citations: Optional[list[dict]] = None,
-    status: str = "complete",
+    status: str = "completed",
+    metadata: Optional[dict] = None,
 ) -> Optional[MessageRecord]:
     """Append an assistant message and atomically update conversation metadata."""
     return await _append_message(
         thread_id, user_id, "assistant", content,
-        citations=citations, status=status,
+        citations=citations, status=status, metadata=metadata,
     )
 
 

@@ -61,7 +61,7 @@ class MessageRecord(BaseModel):
     citations: list[dict[str, Any]] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=_utcnow)
     sequence: int = 0            # ascending within thread; used for ordering
-    status: str = "complete"     # "complete" | "partial" | "error"
+    status: str = "completed"    # "completed" | "error"
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     model_config = {"arbitrary_types_allowed": True}

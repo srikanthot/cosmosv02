@@ -67,3 +67,73 @@ async def health() -> dict:
         "status": "ok",
         "storage": "cosmos" if is_storage_enabled() else "in-memory",
     }
+
+
+@app.get("/health/cosmos")
+async def health_cosmos() -> dict:
+    """Detailed Cosmos DB health check — verifies connectivity to DB and containers.
+
+    Returns success/failure JSON with database and container names.
+    Never exposes secrets.
+    """
+    from app.config.settings import (
+        COSMOS_CONVERSATIONS_CONTAINER,
+        COSMOS_DATABASE,
+        COSMOS_ENDPOINT,
+        COSMOS_MESSAGES_CONTAINER,
+    )
+    from app.storage.cosmos_client import (
+        get_conversations_container,
+        get_messages_container,
+        is_storage_enabled,
+    )
+
+    if not COSMOS_ENDPOINT:
+        return {
+            "status": "disabled",
+            "reason": "COSMOS_ENDPOINT not configured",
+            "database": COSMOS_DATABASE,
+            "conversations_container": COSMOS_CONVERSATIONS_CONTAINER,
+            "messages_container": COSMOS_MESSAGES_CONTAINER,
+        }
+
+    if not is_storage_enabled():
+        return {
+            "status": "error",
+            "reason": "Cosmos client failed to initialize — check startup logs",
+            "database": COSMOS_DATABASE,
+            "conversations_container": COSMOS_CONVERSATIONS_CONTAINER,
+            "messages_container": COSMOS_MESSAGES_CONTAINER,
+        }
+
+    # Probe both containers with a lightweight point-read that will 404 but confirms
+    # the container is reachable.
+    errors: list[str] = []
+    for label, container in [
+        ("conversations", get_conversations_container()),
+        ("messages", get_messages_container()),
+    ]:
+        try:
+            await container.read_item(item="__health_probe__", partition_key="__probe__")
+        except Exception as exc:
+            # 404 means the container is reachable (item just doesn't exist — expected).
+            # Any other exception indicates a connectivity or auth problem.
+            msg = str(exc)
+            if "404" not in msg and "NotFound" not in msg:
+                errors.append(f"{label}: {type(exc).__name__}: {msg[:120]}")
+
+    if errors:
+        return {
+            "status": "error",
+            "reason": "; ".join(errors),
+            "database": COSMOS_DATABASE,
+            "conversations_container": COSMOS_CONVERSATIONS_CONTAINER,
+            "messages_container": COSMOS_MESSAGES_CONTAINER,
+        }
+
+    return {
+        "status": "ok",
+        "database": COSMOS_DATABASE,
+        "conversations_container": COSMOS_CONVERSATIONS_CONTAINER,
+        "messages_container": COSMOS_MESSAGES_CONTAINER,
+    }

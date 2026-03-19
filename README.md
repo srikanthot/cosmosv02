@@ -2,7 +2,7 @@
 
 A streaming RAG chatbot for PSEG field technicians. Ask questions against internal technical manuals and get grounded, citation-backed answers in real time.
 
-**Stack:** FastAPI · Azure AI Search (hybrid + vector) · Azure OpenAI (GCC High) · Microsoft Agent Framework SDK · Streamlit
+**Stack:** FastAPI · Azure AI Search (hybrid + vector) · Azure OpenAI (GCC High) · Microsoft Agent Framework SDK · Azure Cosmos DB · Streamlit
 
 ---
 
@@ -15,7 +15,8 @@ This repo uses the **Microsoft Agent Framework SDK** (`agent-framework-core==1.0
 | `AzureOpenAIChatClient` | Azure OpenAI connection (API-key auth, GCC High endpoint) |
 | `client.as_agent()` | Creates the `PSEGTechManualAgent` ChatAgent |
 | `RagContextProvider(BaseContextProvider)` | Injects retrieved Azure AI Search chunks via `before_run()` |
-| `InMemoryHistoryProvider` | Multi-turn conversation memory (local; swap for Cosmos later) |
+| `InMemoryHistoryProvider` | Warm-session multi-turn memory (in-process) |
+| `CosmosHistoryProvider` | Cold-start history injection from Cosmos DB on first turn per process restart |
 | `agent.run(stream=True)` → `ResponseStream` | Streams tokens to the SSE pipeline |
 
 ---
@@ -59,6 +60,50 @@ POST /chat/stream
 
 ---
 
+## Persistent Chat History (Cosmos DB)
+
+Conversation history is stored in **Azure Cosmos DB for NoSQL** with two containers:
+
+| Container | Partition key | One document per |
+|---|---|---|
+| `conversations` | `/user_id` | chat thread |
+| `messages` | `/thread_id` | message turn |
+
+**How multi-turn context works:**
+
+1. Every user question is persisted to Cosmos before the LLM is called.
+2. Every assistant answer + citations are persisted after generation.
+3. On the first request to a thread (cold start — e.g. after server restart), prior messages are loaded from Cosmos and injected once as context before the LLM call.
+4. On subsequent requests within the same process (warm session), the Agent Framework `InMemoryHistoryProvider` holds in-process turn history — no redundant Cosmos reads.
+
+**Local testing without real user authentication:**
+
+The backend resolves user identity from request headers using this priority:
+
+1. `X-MS-CLIENT-PRINCIPAL-ID` — Azure App Service managed auth (production)
+2. `X-Debug-User-Id` — debug header for simulating different local users
+3. `DEFAULT_LOCAL_USER_ID` env var — default local identity (`local-dev`)
+4. `"anonymous"` — final fallback
+
+During local development, all conversations are stored under the `DEFAULT_LOCAL_USER_ID` value (`local-dev` by default). This proves true persistence — data survives server restarts and browser refreshes — even before real auth is configured. When production auth is enabled later, the same storage model works identically with real user IDs.
+
+**Required Cosmos environment variables:**
+
+```
+COSMOS_AUTH_MODE=key
+COSMOS_ENDPOINT=https://<account>.documents.azure.com:443/
+COSMOS_KEY=<primary-key>
+COSMOS_DATABASE=ragchatdb
+COSMOS_CONVERSATIONS_CONTAINER=conversations
+COSMOS_MESSAGES_CONTAINER=messages
+COSMOS_AUTO_CREATE_CONTAINERS=false
+COSMOS_HISTORY_MAX_TURNS=12
+```
+
+**To switch to managed identity in production** (Azure App Service), set `COSMOS_AUTH_MODE=managed_identity` and remove `COSMOS_KEY`. The backend will use `DefaultAzureCredential` automatically.
+
+---
+
 ## Azure AI Search Setup
 
 If you are setting up the index from scratch (new Azure subscription), see
@@ -98,7 +143,7 @@ pip install -r frontend/requirements.txt
 
 ```bash
 # Backend
-cp .env.backend.example backend/.env
+cp backend/.env.example backend/.env
 
 # Frontend
 cp .env.frontend.example frontend/.env
@@ -170,6 +215,48 @@ Open [http://localhost:8501](http://localhost:8501).
 | `ALLOWED_ORIGINS` | no | Default: `*`. Comma-separated CORS origins for the backend. Set to your frontend URL in Azure (e.g. `https://pseg-frontend.azurewebsites.net`) |
 | `BACKEND_URL` | no | Default: `http://localhost:8000`. Frontend uses this to reach the API. Set to your backend App Service URL in Azure |
 | `FRONTEND_TITLE` | no | Default: `PSEG Tech Manual Agent`. Browser tab title for the Streamlit app |
+| `COSMOS_AUTH_MODE` | no | `key` (default, local) or `managed_identity` (production App Service) |
+| `COSMOS_ENDPOINT` | yes* | `https://<account>.documents.azure.com:443/` — omit to disable persistent history |
+| `COSMOS_KEY` | yes* | Primary key — required when `COSMOS_AUTH_MODE=key` |
+| `COSMOS_DATABASE` | no | Default: `ragchatdb` |
+| `COSMOS_CONVERSATIONS_CONTAINER` | no | Default: `conversations` |
+| `COSMOS_MESSAGES_CONTAINER` | no | Default: `messages` |
+| `COSMOS_AUTO_CREATE_CONTAINERS` | no | Default: `false`. Set `true` only if you want the backend to create the DB/containers on startup |
+| `COSMOS_HISTORY_MAX_TURNS` | no | Default: `12`. Max prior messages injected into LLM context per turn |
+| `COSMOS_ENABLE_TTL` | no | Default: `false`. Set `true` to auto-expire documents after `COSMOS_TTL_SECONDS` |
+| `COSMOS_TTL_SECONDS` | no | Default: `7776000` (90 days). Blank = use default |
+| `DEFAULT_LOCAL_USER_ID` | no | Default: `local-dev`. Used as `user_id` when no auth headers are present |
+
+## Testing Cosmos history locally
+
+### Run the smoke test script
+
+```bash
+# Terminal 1 — activate backend venv
+source .venv-backend/Scripts/activate
+cd backend
+python ../scripts/test_cosmos_history.py
+```
+
+This creates `thread_test_001` under user `local-dev`, writes a user message and an
+assistant message with a citation, reads them back, and prints a pass/fail report.
+Run it a second time to confirm the data is still there (persistence verified).
+
+### Verify after page refresh
+
+Start the backend and Streamlit frontend, ask a question in the chat UI, then:
+1. Stop the backend (`Ctrl+C`).
+2. Restart it (`uvicorn app.main:app --reload --port 8000`).
+3. Reload the Streamlit page.
+4. Select the same conversation from the sidebar — prior messages are reloaded from Cosmos.
+
+### Verify in Azure Portal
+
+1. Open your Cosmos DB account in the Azure Portal.
+2. Go to **Data Explorer** → `ragchatdb` → `conversations` → **Items**.
+3. You should see one document per chat thread (partition key = `user_id`).
+4. Go to **Data Explorer** → `ragchatdb` → `messages` → **Items**.
+5. You should see one document per message (partition key = `thread_id`).
 
 ## Project layout
 

@@ -232,6 +232,20 @@ async def create_conversation(
     return _conv_to_response(conv)
 
 
+@router.get("/conversations/{thread_id}")
+async def get_conversation(
+    thread_id: str,
+    identity: UserIdentity = Depends(get_identity),
+) -> ConversationResponse:
+    """Return metadata for a single conversation thread."""
+    if not is_storage_enabled():
+        raise HTTPException(status_code=503, detail="Storage unavailable")
+    conv = await chat_store.get_conversation(thread_id, identity.user_id)
+    if conv is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return _conv_to_response(conv)
+
+
 @router.get("/conversations/{thread_id}/messages")
 async def get_conversation_messages(
     thread_id: str,

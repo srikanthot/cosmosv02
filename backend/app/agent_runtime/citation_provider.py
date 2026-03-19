@@ -9,13 +9,8 @@ Results are assumed to arrive ordered by relevance score descending, so the
 first occurrence of each key is the most relevant chunk.
 """
 
+from app.agent_runtime.context_providers import _section_path
 from app.api.schemas import Citation
-
-
-def _section_path(r: dict) -> str:
-    """Build a section breadcrumb from header_1/2/3 fields."""
-    parts = [r.get("section1") or "", r.get("section2") or "", r.get("section3") or ""]
-    return " > ".join(p for p in parts if p)
 
 
 def build_citations(results: list[dict]) -> list[Citation]:

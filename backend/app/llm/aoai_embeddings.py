@@ -6,8 +6,6 @@ search. This module calls the embeddings deployment and returns a list[float]
 vector ready for VectorizedQuery.
 """
 
-import logging
-
 from openai import AzureOpenAI
 
 from app.config.settings import (
@@ -16,8 +14,6 @@ from app.config.settings import (
     AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT,
     AZURE_OPENAI_ENDPOINT,
 )
-
-logger = logging.getLogger(__name__)
 
 
 def _get_client() -> AzureOpenAI:

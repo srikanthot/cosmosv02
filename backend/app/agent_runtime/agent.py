@@ -291,7 +291,7 @@ async def _persist_assistant(
     """Persist the assistant message and citations to Cosmos."""
     if not is_storage_enabled() or not answer_text:
         return
-    status = "error" if had_error else "complete"
+    status = "error" if had_error else "completed"
     citations_dicts = [c.model_dump() for c in citations]
     await chat_store.append_assistant_message(
         thread_id, user_id, answer_text, citations=citations_dicts, status=status
