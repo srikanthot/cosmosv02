@@ -2,13 +2,22 @@
 
 All configuration is driven by .env so the same codebase works across
 dev / staging / production without code changes.
+
+dotenv load order:
+  load_dotenv(override=False) — real environment variables always win.
+  .env is only used to fill in variables that are NOT already set.
+  This means a deployed process (Azure App Service, Docker) sets its own
+  env vars and .env is silently ignored, while a local developer without
+  those vars set gets them from .env.
 """
 
 import os
 
 from dotenv import load_dotenv
 
-load_dotenv(override=True)
+# override=False: .env fills gaps only — does NOT override already-set env vars.
+# Safe for both local dev (uses .env) and production (uses real env vars).
+load_dotenv(override=False)
 
 # ---------------------------------------------------------------------------
 # Azure OpenAI (GCC High — openai.azure.us)
@@ -106,12 +115,14 @@ COSMOS_KEY: str = os.getenv("COSMOS_KEY", "")
 COSMOS_DATABASE: str = os.getenv("COSMOS_DATABASE", "ragchatdb")
 COSMOS_CONVERSATIONS_CONTAINER: str = os.getenv("COSMOS_CONVERSATIONS_CONTAINER", "conversations")
 COSMOS_MESSAGES_CONTAINER: str = os.getenv("COSMOS_MESSAGES_CONTAINER", "messages")
-# Auto-create database and containers on startup if they don't exist
+# false = expect containers to already exist (manual Portal setup — production default)
+# true  = auto-create database and containers on startup (dev/test convenience only)
 COSMOS_AUTO_CREATE_CONTAINERS: bool = os.getenv("COSMOS_AUTO_CREATE_CONTAINERS", "false").lower() == "true"
 # Max prior turns (messages) to load per thread for LLM context
 COSMOS_HISTORY_MAX_TURNS: int = int(os.getenv("COSMOS_HISTORY_MAX_TURNS", "12"))
 # TTL — set COSMOS_ENABLE_TTL=true to auto-expire documents
 COSMOS_ENABLE_TTL: bool = os.getenv("COSMOS_ENABLE_TTL", "false").lower() == "true"
+# Blank value is safe — falls back to 90-day default
 COSMOS_TTL_SECONDS: int = int(os.getenv("COSMOS_TTL_SECONDS", "7776000") or "7776000")  # 90 days
 
 # ---------------------------------------------------------------------------

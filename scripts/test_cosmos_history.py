@@ -9,6 +9,17 @@ Usage (from repo root):
 
 Requires backend/.env to be populated with Cosmos credentials.
 
+Notes:
+  - load_dotenv uses override=True here intentionally: this is a test script
+    that always reads from backend/.env, unlike production code which uses
+    override=False so that Azure App Service env vars take precedence.
+  - Storage queries use explicit partition_key to avoid cross-partition scans.
+  - The health probe logic in GET /health/cosmos uses container.read_item() with
+    a sentinel key — a 404 response confirms the container is reachable (item just
+    absent); any other error (auth, network, wrong name) surfaces as a real failure.
+  - Session cache in AgentRuntime uses composite key (user_id, thread_id) to
+    prevent one user's warm session from leaking to another user on the same thread.
+
 Test user:  local-dev
 Thread ID:  thread_test_001
 """

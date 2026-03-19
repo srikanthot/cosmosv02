@@ -9,9 +9,16 @@ Chat endpoints (backward-compatible):
 Conversation management endpoints:
   GET    /conversations                        — list user's threads
   POST   /conversations                        — create new thread
+  GET    /conversations/{thread_id}            — get one conversation metadata
   GET    /conversations/{thread_id}/messages   — ordered message history
   DELETE /conversations/{thread_id}            — soft delete
   PATCH  /conversations/{thread_id}            — rename title
+
+Storage-unavailable behavior:
+  Chat endpoints (POST /chat, POST /chat/stream) still work in degraded mode
+  when storage is disabled — they generate answers but do not persist history.
+  All conversation management endpoints return HTTP 503 when storage is
+  disabled, since they are meaningless without a working storage backend.
 
 Multi-user isolation:
   When the client supplies a session_id in a chat request, the route
@@ -52,6 +59,11 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 _runtime = AgentRuntime()
+
+_STORAGE_DISABLED_503 = HTTPException(
+    status_code=503,
+    detail="Storage unavailable — Cosmos DB is not configured or failed to initialize.",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +139,11 @@ async def _assert_conversation_ownership(thread_id: str, user_id: str) -> None:
         )
 
 
+def _q_preview(question: str, max_len: int = 80) -> str:
+    """Return a truncated question safe for logging."""
+    return question[:max_len] + "…" if len(question) > max_len else question
+
+
 # ---------------------------------------------------------------------------
 # Chat endpoints
 # ---------------------------------------------------------------------------
@@ -138,8 +155,8 @@ async def chat_stream(
 ) -> StreamingResponse:
     """Stream a grounded answer with citations via Server-Sent Events."""
     logger.info(
-        "POST /chat/stream | user=%s session=%s | question=%s",
-        identity.user_id, body.session_id, body.question,
+        "POST /chat/stream | user=%s session=%s | q=%s",
+        identity.user_id, body.session_id, _q_preview(body.question),
     )
 
     # Ownership check before starting the stream.  If the client supplied a
@@ -169,18 +186,15 @@ async def chat(
     Delegates directly to AgentRuntime.run_once() — no SSE parsing involved.
     """
     logger.info(
-        "POST /chat | user=%s session=%s | question=%s",
-        identity.user_id, body.session_id, body.question,
+        "POST /chat | user=%s session=%s | q=%s",
+        identity.user_id, body.session_id, _q_preview(body.question),
     )
 
-    # Ownership check: reject client-supplied thread_ids that don't belong
-    # to this user before any work is done.
     if body.session_id:
         await _assert_conversation_ownership(body.session_id, identity.user_id)
 
     session = _make_session(body)
     result = await _runtime.run_once(body.question, session, identity)
-    # run_once already returns the correct shape; pass through unchanged.
     return result
 
 
@@ -195,7 +209,7 @@ async def list_conversations(
 ) -> list[ConversationResponse]:
     """Return recent conversations for the resolved user, newest first."""
     if not is_storage_enabled():
-        return []
+        raise _STORAGE_DISABLED_503
     convs = await chat_store.list_conversations(identity.user_id, limit=limit)
     return [_conv_to_response(c) for c in convs]
 
@@ -206,29 +220,19 @@ async def create_conversation(
     identity: UserIdentity = Depends(get_identity),
 ) -> ConversationResponse:
     """Create a new empty conversation thread and return its thread_id."""
+    if not is_storage_enabled():
+        raise _STORAGE_DISABLED_503
+
     thread_id = str(uuid.uuid4())
     title = body.title or "New Chat"
-
-    if is_storage_enabled():
-        conv = await chat_store.create_conversation(
-            thread_id=thread_id,
-            user_id=identity.user_id,
-            user_name=identity.user_name,
-            title=title,
-        )
-        if conv is None:
-            raise HTTPException(status_code=503, detail="Storage unavailable")
-        return _conv_to_response(conv)
-
-    # Storage disabled — return a minimal ephemeral representation
-    from app.storage.models import ConversationRecord
-    conv = ConversationRecord(
-        id=thread_id,
+    conv = await chat_store.create_conversation(
         thread_id=thread_id,
         user_id=identity.user_id,
         user_name=identity.user_name,
         title=title,
     )
+    if conv is None:
+        raise HTTPException(status_code=503, detail="Storage unavailable")
     return _conv_to_response(conv)
 
 
@@ -239,7 +243,7 @@ async def get_conversation(
 ) -> ConversationResponse:
     """Return metadata for a single conversation thread."""
     if not is_storage_enabled():
-        raise HTTPException(status_code=503, detail="Storage unavailable")
+        raise _STORAGE_DISABLED_503
     conv = await chat_store.get_conversation(thread_id, identity.user_id)
     if conv is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
@@ -258,17 +262,14 @@ async def get_conversation_messages(
     does not exist for this user the function returns [] and 404 is raised here.
     """
     if not is_storage_enabled():
-        return []
+        raise _STORAGE_DISABLED_503
 
-    # get_messages_for_user validates ownership and filters by user_id.
     messages = await chat_store.get_messages_for_user(
         thread_id, identity.user_id, max_turns=limit
     )
 
     # If empty, confirm whether the conversation exists for this user.
-    # An empty list from get_messages_for_user can mean either "no messages yet"
-    # or "conversation not found for this user".  We distinguish them to give
-    # the correct HTTP status.
+    # An empty list can mean either "no messages yet" or "conversation not found".
     if not messages:
         conv = await chat_store.get_conversation(thread_id, identity.user_id)
         if conv is None:
@@ -284,7 +285,7 @@ async def delete_conversation(
 ) -> dict:
     """Soft-delete a conversation (marks is_deleted=true, does not remove data)."""
     if not is_storage_enabled():
-        return {"deleted": False, "reason": "storage_disabled"}
+        raise _STORAGE_DISABLED_503
 
     success = await chat_store.soft_delete_conversation(thread_id, identity.user_id)
     if not success:
@@ -301,7 +302,7 @@ async def update_conversation(
 ) -> ConversationResponse:
     """Rename a conversation thread."""
     if not is_storage_enabled():
-        raise HTTPException(status_code=503, detail="Storage unavailable")
+        raise _STORAGE_DISABLED_503
 
     success = await chat_store.update_conversation_title(
         thread_id, identity.user_id, body.title

@@ -10,9 +10,9 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 def _utcnow() -> datetime:
@@ -56,12 +56,24 @@ class MessageRecord(BaseModel):
     id: str = Field(default_factory=_new_id)
     thread_id: str
     user_id: str
-    role: str                    # "user" | "assistant"
+    role: Literal["user", "assistant"]           # enforced by Pydantic
     content: str
     citations: list[dict[str, Any]] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=_utcnow)
     sequence: int = 0            # ascending within thread; used for ordering
-    status: str = "completed"    # "completed" | "error"
+    status: Literal["completed", "error"] = "completed"
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     model_config = {"arbitrary_types_allowed": True}
+
+    @field_validator("status", mode="before")
+    @classmethod
+    def _normalize_status(cls, v: str) -> str:
+        """Normalize legacy 'complete' → 'completed' for backward compatibility.
+
+        Documents written before the status rename may have status='complete'.
+        This validator silently upgrades them on read so Literal validation passes.
+        """
+        if v == "complete":
+            return "completed"
+        return v

@@ -73,9 +73,18 @@ async def health() -> dict:
 async def health_cosmos() -> dict:
     """Detailed Cosmos DB health check — verifies connectivity to DB and containers.
 
-    Returns success/failure JSON with database and container names.
-    Never exposes secrets.
+    Returns success/failure JSON including database and container names.
+    Never exposes secrets or keys.
+
+    Probe logic:
+      Each container is probed with a point-read for a sentinel item that will
+      always return HTTP 404 (item doesn't exist).  A 404 confirms the container
+      IS reachable — it means the request reached Cosmos and was processed.
+      Any other error (auth, network, wrong endpoint, wrong container name)
+      is reported as a failure.
     """
+    from azure.cosmos.exceptions import CosmosHttpResponseError
+
     from app.config.settings import (
         COSMOS_CONVERSATIONS_CONTAINER,
         COSMOS_DATABASE,
@@ -88,52 +97,47 @@ async def health_cosmos() -> dict:
         is_storage_enabled,
     )
 
+    base = {
+        "database": COSMOS_DATABASE,
+        "conversations_container": COSMOS_CONVERSATIONS_CONTAINER,
+        "messages_container": COSMOS_MESSAGES_CONTAINER,
+    }
+
     if not COSMOS_ENDPOINT:
-        return {
-            "status": "disabled",
-            "reason": "COSMOS_ENDPOINT not configured",
-            "database": COSMOS_DATABASE,
-            "conversations_container": COSMOS_CONVERSATIONS_CONTAINER,
-            "messages_container": COSMOS_MESSAGES_CONTAINER,
-        }
+        return {"status": "disabled", "reason": "COSMOS_ENDPOINT not configured", **base}
 
     if not is_storage_enabled():
         return {
             "status": "error",
             "reason": "Cosmos client failed to initialize — check startup logs",
-            "database": COSMOS_DATABASE,
-            "conversations_container": COSMOS_CONVERSATIONS_CONTAINER,
-            "messages_container": COSMOS_MESSAGES_CONTAINER,
+            **base,
         }
 
-    # Probe both containers with a lightweight point-read that will 404 but confirms
-    # the container is reachable.
+    # Probe both containers with a known-absent item.
+    # CosmosHttpResponseError with status_code 404 → container reachable (item just absent).
+    # Any other CosmosHttpResponseError or generic Exception → real problem.
     errors: list[str] = []
     for label, container in [
         ("conversations", get_conversations_container()),
         ("messages", get_messages_container()),
     ]:
         try:
-            await container.read_item(item="__health_probe__", partition_key="__probe__")
+            await container.read_item(
+                item="__health_probe__",
+                partition_key="__probe__",
+            )
+        except CosmosHttpResponseError as exc:
+            if exc.status_code == 404:
+                # Expected — item doesn't exist, but container IS reachable.
+                pass
+            else:
+                errors.append(
+                    f"{label}: HTTP {exc.status_code} — {exc.message[:120] if exc.message else 'no detail'}"
+                )
         except Exception as exc:
-            # 404 means the container is reachable (item just doesn't exist — expected).
-            # Any other exception indicates a connectivity or auth problem.
-            msg = str(exc)
-            if "404" not in msg and "NotFound" not in msg:
-                errors.append(f"{label}: {type(exc).__name__}: {msg[:120]}")
+            errors.append(f"{label}: {type(exc).__name__}: {str(exc)[:120]}")
 
     if errors:
-        return {
-            "status": "error",
-            "reason": "; ".join(errors),
-            "database": COSMOS_DATABASE,
-            "conversations_container": COSMOS_CONVERSATIONS_CONTAINER,
-            "messages_container": COSMOS_MESSAGES_CONTAINER,
-        }
+        return {"status": "error", "reason": "; ".join(errors), **base}
 
-    return {
-        "status": "ok",
-        "database": COSMOS_DATABASE,
-        "conversations_container": COSMOS_CONVERSATIONS_CONTAINER,
-        "messages_container": COSMOS_MESSAGES_CONTAINER,
-    }
+    return {"status": "ok", **base}

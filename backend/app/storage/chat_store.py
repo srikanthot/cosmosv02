@@ -21,6 +21,11 @@ Multi-user isolation guarantees:
     (user_id A and user_id B).  This is harmless because message reads/writes
     are always scoped to the calling user's user_id.
 
+Partition key usage:
+  All queries pass an explicit partition_key so Cosmos routes to a single
+  physical partition rather than performing a cross-partition fan-out scan.
+  This reduces RU cost and latency.
+
 Sequence safety:
   _append_message() uses optimistic concurrency (CAS) on the conversation
   document's _etag to atomically reserve the next sequence number and update
@@ -47,7 +52,9 @@ from app.storage.models import ConversationRecord, MessageRecord, _utcnow
 
 logger = logging.getLogger(__name__)
 
-_PREVIEW_MAX_CHARS = 120
+# Preview length shown in the conversation sidebar / list.
+# 200 chars gives enough context for a meaningful snippet in most UIs.
+_PREVIEW_MAX_CHARS = 200
 _MAX_CAS_RETRIES = 5
 
 
@@ -170,14 +177,14 @@ async def get_conversation(
     except CosmosHttpResponseError as exc:
         if exc.status_code != 404:
             logger.warning(
-                "chat_store: failed to read conversation | thread=%s user=%s | %s",
-                thread_id, user_id, exc,
+                "chat_store: failed to read conversation | thread=%s user=%s | HTTP %d",
+                thread_id, user_id, exc.status_code,
             )
         return None
     except Exception as exc:
         logger.warning(
             "chat_store: failed to read conversation | thread=%s user=%s | %s",
-            thread_id, user_id, exc,
+            thread_id, user_id, type(exc).__name__,
         )
         return None
 
@@ -187,7 +194,11 @@ async def list_conversations(
     limit: int = 20,
     include_deleted: bool = False,
 ) -> list[ConversationRecord]:
-    """Return recent conversations for a user, ordered by last_message_at desc."""
+    """Return recent conversations for a user, ordered by last_message_at desc.
+
+    Passes partition_key=user_id to avoid a cross-partition scan — the
+    conversations container is partitioned by /user_id.
+    """
     if not is_storage_enabled():
         return []
 
@@ -203,7 +214,10 @@ async def list_conversations(
     ]
     try:
         items = []
-        async for doc in container.query_items(query=query, parameters=params):
+        # partition_key routes this to a single partition — no cross-partition scan.
+        async for doc in container.query_items(
+            query=query, parameters=params, partition_key=user_id
+        ):
             items.append(_doc_to_conversation(doc))
         logger.info("chat_store: listed %d conversations | user=%s", len(items), user_id)
         return items
@@ -290,16 +304,17 @@ async def _append_message(
          Message documents use UUID ids so concurrent messages never collide.
 
     Consistency note:
-      The CAS loop reserves a sequence slot by updating the conversation doc,
-      then separately upserts the message document.  These are two independent
-      writes — not a Cosmos DB transaction.  If the message upsert fails after
-      the CAS replace succeeds, message_count in the conversation will be one
-      ahead of the actual message count.  This is logged as an explicit ERROR
-      so it can be detected and manually corrected if needed.  The risk is low
-      (transient storage errors) but it cannot be fully eliminated without
-      server-side Cosmos transactions (not supported by the SDK's async client
-      in a cross-container scenario).  For production use, consider idempotent
-      message IDs and a reconciliation job.
+      The CAS loop and message upsert are two independent Cosmos writes — not
+      a transaction.  If the message upsert fails after the CAS replace succeeds,
+      message_count in the conversation will be one ahead of the actual message
+      count (a 'lost' sequence slot).  This is:
+        - Logged as an explicit ERROR for detection.
+        - Low probability (transient storage errors only).
+        - Not fixable without cross-container server-side transactions (unsupported
+          by the async Cosmos SDK).
+      For production: a periodic reconciliation job can detect and repair
+      message_count drift by counting messages in the messages container.
+      Message UUIDs are idempotent, so retrying a failed upsert is safe.
     """
     if not is_storage_enabled():
         return None
@@ -397,7 +412,9 @@ async def _append_message(
         except Exception:
             logger.exception(
                 "chat_store: message save failed after sequence reservation — "
-                "sequence slot %d will be unused | thread=%s user=%s",
+                "sequence slot %d will be unused | thread=%s user=%s. "
+                "message_count in conversation is now ahead by 1. "
+                "Retry is safe (message UUID is idempotent).",
                 sequence, thread_id, user_id,
             )
             return None
@@ -451,6 +468,9 @@ async def get_messages_for_user(
     conversation documents with the same thread_id (in different Cosmos
     partitions), each user only sees their own messages.
 
+    Passes partition_key=thread_id to avoid a cross-partition scan — the
+    messages container is partitioned by /thread_id.
+
     Parameters
     ----------
     thread_id:
@@ -501,7 +521,10 @@ async def get_messages_for_user(
 
     try:
         items = []
-        async for doc in container.query_items(query=query, parameters=params):
+        # partition_key=thread_id routes to a single partition — no fan-out.
+        async for doc in container.query_items(
+            query=query, parameters=params, partition_key=thread_id
+        ):
             items.append(_doc_to_message(doc))
         # Reverse to restore ascending (chronological) order
         items.reverse()

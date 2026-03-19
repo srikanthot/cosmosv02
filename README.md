@@ -258,6 +258,26 @@ Start the backend and Streamlit frontend, ask a question in the chat UI, then:
 4. Go to **Data Explorer** → `ragchatdb` → `messages` → **Items**.
 5. You should see one document per message (partition key = `thread_id`).
 
+## Production behavior notes
+
+**Session cache (in-memory warm sessions):**
+The `AgentRuntime` maintains a warm-session cache keyed by `(user_id, thread_id)` composite — never by `thread_id` alone. This prevents one user's conversation state from leaking to another user who happens to share the same thread ID string. Sessions are evicted after 4 hours of inactivity and the cache is capped at 500 entries.
+
+**Storage-unavailable behavior:**
+- `POST /chat` and `POST /chat/stream` continue to work in degraded mode (no history stored).
+- All conversation management endpoints (`GET/POST/PATCH/DELETE /conversations/*`) return HTTP 503 when Cosmos DB is not configured or fails to initialize.
+
+**Startup container verification:**
+When `COSMOS_AUTO_CREATE_CONTAINERS=false` (the default), the backend probes both containers with a lightweight `container.read()` call on startup. If either container is unreachable, startup logs an error and marks storage as disabled rather than silently succeeding.
+
+**Health endpoint probe logic:**
+`GET /health/cosmos` probes each container using `container.read_item()` with a sentinel key. A `404` response confirms the container is reachable (item just absent). Any other `CosmosHttpResponseError` (auth failure, wrong container name, network error) surfaces as a failure with the HTTP status code included in the response.
+
+**Managed identity credential cleanup:**
+When `COSMOS_AUTH_MODE=managed_identity`, the `DefaultAzureCredential` object is stored at startup and explicitly closed during shutdown to release socket connections cleanly.
+
+---
+
 ## Project layout
 
 ```
@@ -268,18 +288,20 @@ pseg-agent-pattern-python/
 ├── README.md
 ├── DEPLOYMENT.md                      # Azure App Service deployment guide
 ├── AZURE_SEARCH_SETUP.md              # Index / skillset / indexer JSON for Azure setup
+├── scripts/
+│   └── test_cosmos_history.py         # Standalone Cosmos smoke test (no server needed)
 ├── backend/
 │   ├── requirements.txt
 │   └── app/
 │       ├── __init__.py
-│       ├── main.py                        # FastAPI app, CORS, /health
+│       ├── main.py                        # FastAPI app, CORS, /health, /health/cosmos
 │       ├── config/
 │       │   ├── __init__.py
 │       │   └── settings.py               # All env vars via python-dotenv
 │       ├── api/
 │       │   ├── __init__.py
-│       │   ├── routes.py                  # POST /chat/stream (thin)
-│       │   └── schemas.py                 # ChatRequest, Citation, CitationsPayload
+│       │   ├── routes.py                  # Chat + conversation management endpoints
+│       │   └── schemas.py                 # Request/response Pydantic models
 │       ├── agent_runtime/
 │       │   ├── __init__.py
 │       │   ├── agent.py                   # AgentRuntime — orchestrator
@@ -288,6 +310,14 @@ pseg-agent-pattern-python/
 │       │   ├── context_providers.py       # Evidence block formatter
 │       │   ├── citation_provider.py       # Citation dedup + structuring
 │       │   └── prompts.py                 # System prompt templates
+│       ├── auth/
+│       │   ├── __init__.py
+│       │   └── identity.py               # UserIdentity + resolve_identity()
+│       ├── storage/
+│       │   ├── __init__.py
+│       │   ├── chat_store.py             # Cosmos CRUD — conversations + messages
+│       │   ├── cosmos_client.py          # Async Cosmos client singleton
+│       │   └── models.py                 # ConversationRecord, MessageRecord (Pydantic)
 │       ├── tools/
 │       │   ├── __init__.py
 │       │   └── retrieval_tool.py          # Hybrid search + adaptive diversity + TOC filter
@@ -299,40 +329,3 @@ pseg-agent-pattern-python/
     ├── requirements.txt
     └── app.py                             # Streamlit UI + SSE consumer
 ```
-
-FEEDBACK_URL = os.getenv("FEEDBACK_URL", "").strip()
-if FEEDBACK_URL:
-    st.markdown("### Feedback")
-    st.markdown(
-        f'<a href="{FEEDBACK_URL}" target="_blank">'
-        f'<button style="width:100%;padding:10px;border:none;border-radius:8px;'
-        f'background:#f26522;color:white;font-weight:600;cursor:pointer;">'
-        f'📝 Share Feedback</button></a>',
-        unsafe_allow_html=True,
-    )
-
-
-    What does Buried Underground Distribution (BUD) mean in the Plant Engineering Policies and Procedures manual?
-What are the work procedures involved in BUD joint trench installations?
-What are the requirements for revenue metering equipment in customer electrical installations?
-What are the general specifications for a customer-owned 26.4 kV outdoor substation?
-Why are surge arresters used in substations, and what purpose do they serve?
-What is an Arc Flash Hazard Calculation Study, and why is it important for electrical systems?
- 
- 
-A developer is planning to install an underground electrical distribution system for a new residential project. What procedures should be followed for Buried Underground Distribution (BUD) installation?
-A customer is planning to build a 26.4 kV outdoor substation to connect to the utility system. What approvals and design requirements must be completed before construction begins?
-During the design of a customer electrical facility, engineers are concerned about worker safety around high-voltage equipment. When should an Arc Flash Hazard Calculation Study be performed and why?
-A company wants to install a solar generation system and connect it to the utility grid as a Non-Utility Generator (NUG). What requirements must be met before it can be connected to the utility system?
-During a storm, a voltage surge damages equipment at a substation. How do surge arresters help protect electrical equipment in such situations?
- 
-What are the guidelines that should be followed for disconnecting switches for Customer-Owned 26.4 kV Outdoor Substation?
- 
-Right now, I am installing the Underground Plastic Piping, so what are the safety measures I should take
- 
-So I went to a location where one customer requested the Instructions for the PSE&G Residential Application for Gas Service, what should i have to say
- 
-I was at one location, and I suspect Theft of Service and Tampering, so what should i have to do
- 
-We removed a light at this pole a few months ago. If the customer wants a new light at the same exact pole within a year, do we treat it as a replacement or a brand-new install
- 
