@@ -1,33 +1,44 @@
-Please fix the following frontend issues in the chatbot UI:
+Please fix these two remaining frontend issues in the chatbot UI.
 
-1. Logo rendering issue
-The PSEG logo in the top-left is not displaying correctly (broken or missing). Please fix the image rendering so the logo loads properly across environments (local and Azure Web App). Check static asset paths, public folder usage, and deployment handling.
-
-2. Incorrect chat history shown for new users/devices
-When the app is opened on a new device or fresh browser session, old chat history from previous users is briefly visible on first load. This should NOT happen.
+Issue 1: Broken logo in the top-left
+The PSEG logo is still not rendering correctly in the top-left sidebar. It shows as a broken image.
 
 Expected behavior:
-- A new user/session should start with an empty recent history
-- Only the current user's chats should be loaded
-- No stale or cached data should be rendered on initial load
-- The UI should not require a refresh to correct this behavior
+- The logo should display properly in the sidebar across local and Azure Web App deployments
+- The image path should work in production
+- Use the correct Next.js static asset approach
 
-Likely issue:
-Stale localStorage/session state or shared backend response is being rendered before proper initialization.
+Please check and fix:
+- whether the logo file is actually present in the correct public folder
+- whether the src path is wrong or case-sensitive
+- whether the code is using an incorrect relative path
+- whether the image should be referenced from /public using a path like /logo.png
+- whether Next Image or normal img tag is being used incorrectly
 
-3. Feedback link not working in Help / Info modal
-In the Help / Info popup, the footer still shows the placeholder text "Feedback form coming soon", even though the feedback form URL has already been configured in the code and in the Azure Web App environment settings.
+Required outcome:
+- logo should load correctly in Azure Web App
+- no broken image icon in the top-left
+
+Issue 2: Feedback link in Info modal footer still shows placeholder text
+In the Help / Info modal footer, it still shows "Feedback form coming soon".
+But the feedback URL is already configured using the frontend environment variable:
+NEXT_PUBLIC_FEEDBACK_URL
 
 Expected behavior:
-- Replace "Feedback form coming soon" with a clickable link or button (e.g., "Feedback Form")
-- Clicking it should open the configured feedback form URL
-- The URL should be dynamically read from the frontend environment configuration
-- Ensure it works correctly in the deployed Azure Web App, not just locally
+- Replace the placeholder text "Feedback form coming soon" with a clickable link or button labeled "Feedback Form"
+- When clicked, it should open the configured feedback form URL
+- The URL must be read from process.env.NEXT_PUBLIC_FEEDBACK_URL
+- This should work in the deployed Azure Web App as well
 
-Things to verify:
-- Environment variable is correctly exposed to the frontend (e.g., NEXT_PUBLIC_ or REACT_APP_ prefix if required)
-- No mismatch between variable name in code and Azure configuration
-- UI is not using hardcoded placeholder text anymore
-- Link is rendered and clickable in the modal footer
+Please check and fix:
+- confirm the component is actually reading process.env.NEXT_PUBLIC_FEEDBACK_URL
+- confirm the environment variable name exactly matches NEXT_PUBLIC_FEEDBACK_URL
+- confirm the UI is not still using hardcoded placeholder text
+- if NEXT_PUBLIC_FEEDBACK_URL exists, render a clickable anchor tag
+- if the variable is missing, only then show a fallback message
 
-Please fix all three issues and ensure correct behavior on first load without requiring a refresh.
+Suggested footer behavior:
+- if feedback URL exists: show clickable "Feedback Form"
+- if not: show "Feedback form coming soon"
+
+Please make the fix directly in the frontend code and update the modal footer rendering logic.
