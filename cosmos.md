@@ -384,3 +384,54 @@ Do not rewrite the whole app.
 Refactor around the current backend architecture and preserve the existing API behavior wherever possible.
 
 Now inspect the current backend codebase under backend/ and implement these changes end-to-end.
+
+
+
+
+
+
+I confirmed this is a Next.js frontend and there is currently no MSAL / Microsoft Entra ID authentication implemented.
+
+I need you to implement a production-ready Microsoft Entra ID authentication setup for this app, not a basic demo.
+
+Requirements:
+- This is a Next.js project
+- Use Microsoft Entra ID with MSAL
+- Use NEXT_PUBLIC environment variables, not REACT_APP variables
+- Keep the existing app working
+- Do not make unnecessary UI changes
+- Make the implementation clean, modular, and maintainable
+- Do not give me a temporary or shortcut solution
+- Build it in a way suitable for production deployment in Azure Web App
+
+Use these environment variables:
+- NEXT_PUBLIC_CLIENT_ID
+- NEXT_PUBLIC_AUTHORITY
+- NEXT_PUBLIC_REDIRECT_URI
+
+What I want from you:
+1. Inspect the project structure first and decide the correct integration points
+2. Add the required MSAL packages
+3. Create proper auth configuration files
+4. Add a reusable auth provider/wrapper in the correct place for Next.js
+5. Add login and logout support
+6. Show the signed-in user name in the UI
+7. Protect the chat page or main app so unauthenticated users cannot use it
+8. Keep the code organized for future backend token validation
+9. Use best practices for production-level frontend auth structure
+10. Show full updated code for each file you create or modify
+
+Important:
+- Do not use REACT_APP variables
+- Do not hardcode client ID, authority, or redirect URI
+- Do not change unrelated files
+- Do not give partial snippets only
+- Explain why each file is being added or changed
+- Tell me exactly which files are new and which files are modified
+- If there are multiple valid approaches, choose the one best suited for production in Next.js and explain why
+
+Before changing code, first tell me:
+- the implementation plan
+- which files you will add or modify
+- which auth approach you are choosing for this Next.js app
+Then proceed file by file with full code.
