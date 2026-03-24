@@ -449,3 +449,16 @@ But include the following production requirements:
 6. Make the setup compatible with Azure GCC High environment
 
 Proceed file by file with full code.
+
+
+Show me the full code for authConfig.js now.
+
+Requirements:
+- Use NEXT_PUBLIC_CLIENT_ID
+- Use NEXT_PUBLIC_AUTHORITY
+- Use NEXT_PUBLIC_REDIRECT_URI
+- Include Azure GCC High compatible configuration
+- Include knownAuthorities if needed
+- Include production-safe defaults
+- Do not hardcode secrets
+- Explain each section briefly after the full code
