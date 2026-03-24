@@ -435,3 +435,17 @@ Before changing code, first tell me:
 - which files you will add or modify
 - which auth approach you are choosing for this Next.js app
 Then proceed file by file with full code.
+
+
+The plan looks good. Proceed with implementation.
+
+But include the following production requirements:
+
+1. Use loginRedirect instead of loginPopup
+2. After login, implement acquireTokenSilent to get access token
+3. Attach access token to all backend API calls as Authorization Bearer token
+4. Add proper error handling for login and token acquisition
+5. Ensure logout clears session and redirects properly
+6. Make the setup compatible with Azure GCC High environment
+
+Proceed file by file with full code.
